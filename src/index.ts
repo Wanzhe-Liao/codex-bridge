@@ -5,6 +5,7 @@ import { loadConfig } from "./config.js";
 import { createMcpServer } from "./tools.js";
 import { codexVersion, TaskManager } from "./task-manager.js";
 import { StateStore } from "./store.js";
+import { VERSION } from "./version.js";
 
 export interface SupervisorRuntime {
   client: AppServerClient;
@@ -16,7 +17,7 @@ export interface SupervisorRuntime {
 export function createRuntime(): SupervisorRuntime {
   const config = loadConfig();
   const store = new StateStore();
-  const client = new AppServerClient({ version: "0.1.0" });
+  const client = new AppServerClient({ version: VERSION });
   const manager = new TaskManager(client, store, config);
   const server = createMcpServer(manager);
   return { client, store, manager, server };

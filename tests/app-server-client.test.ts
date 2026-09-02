@@ -10,7 +10,7 @@ describe("AppServerClient", () => {
     client.on("outbound", (message) => outbound.push(message));
     await client.start();
     expect(outbound[0]).toMatchObject({ id: 1, method: "initialize" });
-    expect(outbound[0].params).toMatchObject({ clientInfo: { name: "chatgpt_web_codex_supervisor", title: "ChatGPT Web Codex Supervisor", version: "0.1.0" } });
+    expect(outbound[0].params).toMatchObject({ clientInfo: { name: "chatgpt_web_codex_supervisor", title: "ChatGPT Web Codex Supervisor", version: "0.2.0" } });
     expect(outbound[1]).toEqual({ jsonrpc: "2.0", method: "initialized" });
     await client.request("model/list", {});
     expect(outbound[2]).toMatchObject({ id: 2, method: "model/list" });

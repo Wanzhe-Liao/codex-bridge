@@ -139,7 +139,7 @@ export function makeConfig(cwd = process.cwd()): any {
     path: "mock-config.toml", exists: true,
     projects: { default: { id: "default", cwd } },
     profiles: { default: { id: "default", model: "", effort: "", approvalPolicy: "on-request", sandboxType: "workspace-write", networkAccess: false, waitTimeoutSeconds: 1 } },
-    defaultWaitTimeoutSeconds: 1, maxInputLength: 100_000, maxPageSize: 100, maxCommandOutput: 4_000, restartAttempts: 0,
+    defaultWaitTimeoutSeconds: 1, maxInputLength: 100_000, maxPageSize: 100, maxCommandOutput: 4_000, maxArtifactBytes: 32 * 1024 * 1024, restartAttempts: 0,
     redactionPatterns: [], sensitivePaths: [".env", ".ssh"],
   };
 }

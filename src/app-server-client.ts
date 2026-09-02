@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { AppServerProcessLike } from "./app-server-process.js";
 import { spawnAppServer } from "./app-server-process.js";
+import { VERSION } from "./version.js";
 
 export type JsonRpcId = string | number;
 export interface JsonRpcErrorShape { code: number; message: string; data?: unknown }
@@ -50,7 +51,7 @@ export class AppServerClient extends EventEmitter {
   constructor(options: AppServerClientOptions = {}) {
     super();
     this.processFactory = options.processFactory ?? (() => spawnAppServer());
-    this.version = options.version ?? "0.1.0";
+    this.version = options.version ?? VERSION;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
     this.logger = options.logger ?? ((message) => process.stderr.write(`[app-server] ${message}\n`));
   }

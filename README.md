@@ -1,6 +1,6 @@
 # Codex Bridge
 
-Codex Bridge is a local stdio MCP server that lets ChatGPT supervise the real Codex runtime without exposing a second file, shell, Git, SSH, or model loop.
+Codex Bridge is a local stdio MCP server that lets ChatGPT supervise the real Codex runtime and receive project artifacts without exposing a second shell, Git, SSH, or model loop.
 
 ```text
 ChatGPT GPT Pro
@@ -10,7 +10,7 @@ ChatGPT GPT Pro
   -> local Codex models, tools, projects, and configured MCP servers
 ```
 
-The MCP layer manages only Codex threads, turns, events, approvals, questions, recovery, and delivery evidence. Codex remains responsible for project reads/writes, commands, Git, SSH, MCP tools, research work, and its final natural-language answer.
+The MCP layer manages Codex threads, turns, events, approvals, questions, recovery, and delivery evidence. A read-only artifact layer also lets ChatGPT browse and transfer files from configured projects for inspection, inline preview, and download. Codex remains responsible for project writes, commands, Git, SSH, MCP tools, research work, and its final natural-language answer.
 
 ## Requirements and setup
 
@@ -28,6 +28,8 @@ npm run build
 Copy `config.example.toml` to `~/.config/codex-supervisor-mcp/config.toml`, then register only absolute project directories that ChatGPT may select. ChatGPT supplies `project_id` and an optional local `profile`; it cannot supply an arbitrary working directory, provider, or app-server command. The legacy `codex-supervisor-mcp` configuration and state directory names are intentionally retained for compatibility with existing installations.
 
 ```toml
+max_artifact_bytes = 33554432 # 32 MiB; configurable up to 256 MiB
+
 [projects.default]
 cwd = "/absolute/path/to/project"
 
@@ -66,6 +68,22 @@ machine has multiple Codex installations, set the local (never ChatGPT-provided)
 - `codex_result`: return an authoritative terminal delivery, Codex's natural-language final message, and independent evidence.
 - `codex_inspect`: paginate transcript, plan, diff, commands, bounded output, file changes, MCP calls, warnings, or redacted raw events.
 - `codex_cancel`: send `turn/interrupt` and wait for authoritative `turn/completed`.
+- `codex_files`: browse or search file metadata inside a configured project; recursive search and pagination are supported.
+- `codex_artifact`: transfer the original file through MCP and render a ChatGPT preview/download component when supported.
+
+The artifact interface has no extension allowlist. It handles text, source files, PDF, images, audio, video, spreadsheets, archives, and arbitrary binary files. Images and audio use native MCP content blocks; other files use embedded resources plus a dynamic `codex-artifact://` resource readable through `resources/read`. PDFs, images, audio, video, and text get an inline viewer; formats the browser cannot render still get the original-file download button.
+
+Example instructions to GPT Pro:
+
+```text
+Use Codex Bridge project default. List PDFs under papers recursively, open the
+latest manuscript, show it to me, and make the original file downloadable.
+```
+
+```text
+Browse project default for results/summary.csv, open it, inspect the contents,
+and attach the original CSV for download. Do not start a Codex task.
+```
 
 `turn/start` never contains `outputSchema`; prompts and final answers remain ordinary natural language. No tool response invents percentage progress. Only `turn/completed` makes the current turn terminal.
 
@@ -86,7 +104,7 @@ codex app-server generate-ts --out <temporary-directory>
 codex app-server generate-json-schema --out <temporary-directory>
 ```
 
-Generated schemas are not copied into the project. Unit tests use a JSONL mock app-server for initialization ordering, IDs, long tasks, plans, commands, diffs, file changes, MCP calls, approvals, questions, persistence, interruption, failure, crash recovery, redaction, tool annotations, and wait semantics.
+Generated schemas are not copied into the project. Unit tests use a JSONL mock app-server for initialization ordering, IDs, long tasks, plans, commands, diffs, file changes, MCP calls, approvals, questions, persistence, interruption, failure, crash recovery, redaction, tool annotations, wait semantics, artifact MIME handling, PDF byte transfer, viewer registration, size bounds, traversal, and symlink escape.
 
 The optional real integration test is disabled by default because it can consume Codex quota:
 
@@ -134,14 +152,16 @@ tunnel-client run \
   --profile codex-bridge
 ```
 
-In ChatGPT on the web, enable Developer mode, create a developer App, select the configured Tunnel, refresh both tools and server instructions, and enable the App in the GPT Pro conversation. The embedded server instructions require GPT Pro to stay in the same response and repeatedly call `codex_wait`, resolve safe requests, wait for authoritative `turn/completed`, then call `codex_result` and inspect objective evidence before replying to the user.
+In ChatGPT on the web, enable Developer mode, create a developer App, select the configured Tunnel, refresh both tools and server instructions, and enable the App in the GPT Pro conversation. The embedded server instructions require GPT Pro to stay in the same response and repeatedly call `codex_wait`, resolve safe requests, wait for authoritative `turn/completed`, then call `codex_result` and inspect objective evidence before replying to the user. After upgrading Codex Bridge, restart `tunnel-client run` and refresh the App's tools/resources so ChatGPT sees the new artifact tools and viewer.
 
 ## Security boundaries
 
 - Project paths and profiles are local allowlists; MCP inputs cannot provide arbitrary absolute paths, providers, or process commands.
+- Artifact paths are relative to an allowlisted project. Lexical traversal and symlinks/junctions that resolve outside the project are rejected. Configured `sensitive_paths` remain unavailable for transfer.
+- Artifact transfer is read-only, has no extension whitelist, and uses the locally configurable `max_artifact_bytes` transport bound to prevent unbounded JSONL/base64 messages.
 - Start/send/respond/cancel are accurately marked mutating and potentially destructive; health/status/wait/result/inspect are read-only.
 - Approval is never globally automatic. High-risk commands, project-external grants, credential-like requests, and arbitrary dynamic tool execution are declined or restricted.
 - Built-in and configurable redaction removes common tokens, private keys, passwords, sensitive paths, and credential fields. Raw reasoning text deltas are not persisted or returned.
-- Command output and pages are bounded. Completed command exit codes, file-change status, MCP status, aggregated diff, and fixed read-only Git checks form the evidence returned by `codex_result`.
+- Command output, artifact size, and pages are bounded. Completed command exit codes, file-change status, MCP status, aggregated diff, and fixed read-only Git checks form the evidence returned by `codex_result`.
 
 Known operational limitation: a supervisor process cannot prove that an in-flight turn survived an app-server crash when `thread/resume` no longer reports an active turn. In that case it preserves all IDs/events and reports nonterminal `connection_lost`; `codex_send` starts a recovery turn on the same thread rather than claiming completion.

@@ -1,7 +1,7 @@
 {
   "name": "codex-bridge",
-  "version": "0.1.0",
-  "description": "A secure stdio MCP bridge that lets ChatGPT supervise the local Codex app-server.",
+  "version": "0.2.0",
+  "description": "A stdio MCP bridge for ChatGPT to supervise local Codex and transfer project artifacts.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -33,11 +33,13 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "better-sqlite3": "12.9.0",
+    "mime-types": "^3.0.2",
     "smol-toml": "1.8.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "@types/mime-types": "^3.0.1",
     "@types/node": "^24.0.0",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",

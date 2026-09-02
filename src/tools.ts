@@ -1,6 +1,10 @@
 import { z } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ContentBlock } from "@modelcontextprotocol/sdk/types.js";
+import { ARTIFACT_WIDGET_HTML, ARTIFACT_WIDGET_URI } from "./artifact-widget.js";
+import { decodeArtifactResourceToken, isTextMime, listArtifacts, loadArtifact } from "./artifacts.js";
 import type { TaskManager } from "./task-manager.js";
+import { VERSION } from "./version.js";
 
 export const SUPERVISOR_INSTRUCTIONS = `You supervise a local Codex agent on behalf of the user.
 
@@ -37,7 +41,15 @@ Do not claim success solely from the Codex agent's self-report.
 
 If the ChatGPT host forcibly interrupts the tool workflow, never represent
 the unfinished task as complete. Preserve and return the task identifier so
-the same task can be resumed.`;
+the same task can be resumed.
+
+PROJECT ARTIFACTS:
+
+You may use codex_files to browse files inside a locally configured project and
+codex_artifact to receive, inspect, preview, or offer the original file for
+download. These tools transfer real file content through MCP; they are not a
+substitute for asking Codex to do project work. Paths are always relative to a
+configured project_id. Never invent an absolute local path.`;
 
 const WAIT_RULE = `\n\nNON-NEGOTIABLE WAIT RULE: after this tool begins or continues work, if the returned task has terminal: false, continue calling codex_wait in the same assistant response until an authoritative app-server turn/completed event reports terminal: true. Timeouts, empty events, commentary, completed commands or plans, and Codex saying it is done are not completion. Resolve pending requests with codex_respond, steer with codex_send when needed, then call codex_result only after terminal: true.`;
 
@@ -56,10 +68,40 @@ const annotation = {
   result: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   inspect: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   cancel: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  files: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  artifact: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 } as const;
 
 export function createMcpServer(manager: TaskManager): McpServer {
-  const server = new McpServer({ name: "codex-bridge", version: "0.1.0" }, { instructions: SUPERVISOR_INSTRUCTIONS });
+  const server = new McpServer({ name: "codex-bridge", version: VERSION }, { instructions: SUPERVISOR_INSTRUCTIONS });
+  const config = manager.supervisorConfig;
+
+  server.registerResource("codex-artifact-viewer", ARTIFACT_WIDGET_URI, {}, async () => ({
+    contents: [{
+      uri: ARTIFACT_WIDGET_URI,
+      mimeType: "text/html;profile=mcp-app",
+      text: ARTIFACT_WIDGET_HTML,
+      _meta: { ui: { prefersBorder: true, csp: { connectDomains: [], resourceDomains: [] } } },
+    }],
+  }));
+
+  server.registerResource(
+    "codex-project-artifact",
+    new ResourceTemplate("codex-artifact://file/{token}", { list: undefined }),
+    { description: "A file inside a locally configured Codex Bridge project." },
+    async (uri, variables) => {
+      const rawToken = variables.token;
+      const token = Array.isArray(rawToken) ? rawToken[0] : rawToken;
+      if (typeof token !== "string") throw new Error("Invalid artifact resource URI");
+      const decoded = decodeArtifactResourceToken(token);
+      const artifact = loadArtifact(config, decoded.projectId, decoded.path);
+      return {
+        contents: [isTextMime(artifact.metadata.mime_type)
+          ? { uri: uri.href, mimeType: artifact.metadata.mime_type, text: artifact.data.toString("utf8") }
+          : { uri: uri.href, mimeType: artifact.metadata.mime_type, blob: artifact.data.toString("base64") }],
+      };
+    },
+  );
   server.registerTool("codex_health", {
     title: "Codex health",
     description: "Read-only health and capability check for the local Codex supervisor, app-server, SQLite, configured projects and local profiles.",
@@ -136,5 +178,66 @@ export function createMcpServer(manager: TaskManager): McpServer {
     inputSchema: { task_id: taskId, reason: z.string().max(4_000).optional() },
     annotations: annotation.cancel,
   }, async ({ task_id, reason }) => jsonResult(await manager.cancel(task_id, reason)));
+
+  server.registerTool("codex_files", {
+    title: "Browse project files",
+    description: "Browse or search real files inside a locally configured project. Paths are project-relative; no file-extension allowlist is applied. Returns file metadata and resource URIs without modifying anything.",
+    inputSchema: {
+      project_id: z.string().min(1).max(128),
+      path: z.string().max(4_096).optional(),
+      recursive: z.boolean().optional(),
+      query: z.string().max(1_000).optional(),
+      offset: z.number().int().min(0).max(1_000_000).optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+    },
+    annotations: annotation.files,
+  }, async ({ project_id, path, recursive, query, offset, limit }) => {
+    const result = listArtifacts(config, project_id, path ?? "", recursive ?? Boolean(query), query, offset ?? 0, limit ?? config.maxPageSize);
+    return { structuredContent: result, ...jsonResult(result) };
+  });
+
+  server.registerTool("codex_artifact", {
+    title: "Open or download project file",
+    description: "Transfer a real project file to ChatGPT for inspection, preview, receipt, or download. Supports text, PDF, image, audio, video, spreadsheets, archives, and other file types without an extension whitelist. Call codex_files first when the relative path is unknown. This tool is read-only and renders a file viewer when supported by the host.",
+    inputSchema: {
+      project_id: z.string().min(1).max(128),
+      path: z.string().min(1).max(4_096),
+    },
+    annotations: annotation.artifact,
+    _meta: {
+      ui: { resourceUri: ARTIFACT_WIDGET_URI },
+      "openai/outputTemplate": ARTIFACT_WIDGET_URI,
+      "openai/toolInvocation/invoking": "Opening project file…",
+      "openai/toolInvocation/invoked": "Project file ready.",
+    },
+  }, async ({ project_id, path }) => {
+    const artifact = loadArtifact(config, project_id, path);
+    const base64 = artifact.data.toString("base64");
+    const content: ContentBlock[] = [
+      { type: "text", text: `Opened ${artifact.metadata.path} (${artifact.metadata.mime_type}, ${artifact.metadata.size} bytes). The original file is attached as an MCP resource and can be previewed or downloaded.` },
+      {
+        type: "resource_link",
+        uri: artifact.metadata.resource_uri,
+        name: artifact.metadata.name,
+        description: `Original file from configured project '${project_id}'`,
+        mimeType: artifact.metadata.mime_type,
+        size: artifact.metadata.size,
+      },
+    ];
+    if (artifact.metadata.mime_type.startsWith("image/")) {
+      content.push({ type: "image", data: base64, mimeType: artifact.metadata.mime_type });
+    } else if (artifact.metadata.mime_type.startsWith("audio/")) {
+      content.push({ type: "audio", data: base64, mimeType: artifact.metadata.mime_type });
+    } else if (isTextMime(artifact.metadata.mime_type)) {
+      content.push({ type: "resource", resource: { uri: artifact.metadata.resource_uri, mimeType: artifact.metadata.mime_type, text: artifact.data.toString("utf8") } });
+    } else {
+      content.push({ type: "resource", resource: { uri: artifact.metadata.resource_uri, mimeType: artifact.metadata.mime_type, blob: base64 } });
+    }
+    return {
+      structuredContent: { artifact: artifact.metadata },
+      content,
+      _meta: { artifact: artifact.metadata },
+    };
+  });
   return server;
 }

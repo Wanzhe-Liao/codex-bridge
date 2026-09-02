@@ -1,6 +1,10 @@
 # Copy this file to ~/.config/codex-supervisor-mcp/config.toml and replace
 # the project path with an absolute path that you explicitly want to allow.
 
+# Maximum size of one file transferred through MCP. No file-extension allowlist
+# is used; increase this if your project contains larger PDFs or media files.
+max_artifact_bytes = 33554432
+
 [projects.default]
 cwd = "/absolute/path/to/your/project"
 

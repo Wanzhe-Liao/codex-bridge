@@ -25,5 +25,8 @@ describe("MCP contracts", () => {
     expect(registered.codex_start.annotations.readOnlyHint).toBe(false);
     expect(registered.codex_send.annotations.destructiveHint).toBe(true);
     expect(registered.codex_result.annotations.readOnlyHint).toBe(true);
+    expect(registered.codex_files.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    expect(registered.codex_artifact.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    expect(registered.codex_artifact._meta.ui.resourceUri).toContain("artifact-viewer");
   });
 });

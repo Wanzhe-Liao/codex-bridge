@@ -37,12 +37,14 @@ export interface SupervisorConfig extends RedactionConfig {
   maxInputLength: number;
   maxPageSize: number;
   maxCommandOutput: number;
+  maxArtifactBytes: number;
   restartAttempts: number;
 }
 
 const DEFAULT_MAX_INPUT = 100_000;
 const DEFAULT_MAX_PAGE = 100;
 const DEFAULT_MAX_OUTPUT = 4_000;
+const DEFAULT_MAX_ARTIFACT_BYTES = 32 * 1024 * 1024;
 
 export function defaultConfigPath(): string {
   const override = process.env.CODEX_SUPERVISOR_CONFIG;
@@ -140,6 +142,7 @@ export function loadConfig(filePath = defaultConfigPath()): SupervisorConfig {
     maxInputLength: numberValue(parsed.max_input_length, DEFAULT_MAX_INPUT, 100, 1_000_000),
     maxPageSize: numberValue(parsed.max_page_size, DEFAULT_MAX_PAGE, 1, 500),
     maxCommandOutput: numberValue(parsed.max_command_output, DEFAULT_MAX_OUTPUT, 256, 20_000),
+    maxArtifactBytes: numberValue(parsed.max_artifact_bytes, DEFAULT_MAX_ARTIFACT_BYTES, 1_024, 256 * 1024 * 1024),
     restartAttempts: numberValue(parsed.restart_attempts, 2, 0, 5),
     redactionPatterns: Array.isArray(patternValues)
       ? patternValues.filter((v: unknown): v is string => typeof v === "string").slice(0, 50)
@@ -218,5 +221,10 @@ export function publicConfig(config: SupervisorConfig): Record<string, unknown> 
       sandboxType: profile.sandboxType,
       networkAccess: profile.networkAccess,
     })),
+    artifactTransfer: {
+      maxBytes: config.maxArtifactBytes,
+      extensionAllowlist: null,
+      sensitivePathsExcluded: (config.sensitivePaths ?? []).length,
+    },
   };
 }
