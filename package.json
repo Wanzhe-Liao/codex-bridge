@@ -1,0 +1,46 @@
+{
+  "name": "codex-bridge",
+  "version": "0.1.0",
+  "description": "A secure stdio MCP bridge that lets ChatGPT supervise the local Codex app-server.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Wanzhe-Liao/codex-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Wanzhe-Liao/codex-bridge/issues"
+  },
+  "homepage": "https://github.com/Wanzhe-Liao/codex-bridge#readme",
+  "keywords": [
+    "codex",
+    "mcp",
+    "model-context-protocol",
+    "chatgpt",
+    "supervisor"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "doctor": "node dist/index.js doctor",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "integration": "node --test --import tsx tests/real-integration.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "better-sqlite3": "13.0.3",
+    "smol-toml": "1.8.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "4.1.11"
+  }
+}

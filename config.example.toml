@@ -1,0 +1,23 @@
+# Copy this file to ~/.config/codex-supervisor-mcp/config.toml and replace
+# the project path with an absolute path that you explicitly want to allow.
+
+[projects.default]
+cwd = "/absolute/path/to/your/project"
+
+[profiles.fast]
+# Leave model empty to inherit the Codex default. Use only IDs shown by model/list.
+model = ""
+# Use an effort string reported by model/list for the selected model, or leave empty.
+effort = ""
+# Current app-server values: on-request, untrusted, never, or a granular object.
+approval_policy = "on-request"
+# Current app-server values: workspace-write, read-only, danger-full-access.
+sandbox_type = "workspace-write"
+network_access = true
+# Optional cap for wait long-polls (seconds).
+wait_timeout_seconds = 40
+
+[redaction]
+# Additional case-insensitive regexes and path fragments to redact from output.
+redaction_patterns = []
+sensitive_paths = [".env", ".ssh", "id_rsa", "id_ed25519"]

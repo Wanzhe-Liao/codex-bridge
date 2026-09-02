@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.supervisor/
+coverage/
+outputs/
+work/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+.env*
+!.env.example
+.npmrc
+*.log
+config.local.toml
