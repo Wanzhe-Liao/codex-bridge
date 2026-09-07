@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import type { AppServerProcessLike } from "./app-server-process.js";
 import { spawnAppServer } from "./app-server-process.js";
 import { VERSION } from "./version.js";
@@ -47,6 +48,8 @@ export class AppServerClient extends EventEmitter {
   private startPromise?: Promise<void>;
   private readonly intentionalStops = new WeakSet<AppServerProcessLike>();
   private connectedAt?: string;
+  private epoch = "";
+  get connectionId(): string { return this.epoch; }
 
   constructor(options: AppServerClientOptions = {}) {
     super();
@@ -71,8 +74,10 @@ export class AppServerClient extends EventEmitter {
   private async startInternal(): Promise<void> {
     const child = this.processFactory();
     this.process = child;
+    this.epoch = randomUUID();
     this.lineBuffer = "";
-    child.stdout.on("data", (chunk: Buffer | string) => this.consumeStdout(chunk.toString()));
+    child.stdout.on("data", (chunk: Buffer | string) => { if (this.process === child) this.consumeStdout(chunk.toString()); });
+    child.stdin.on("error", (error: Error) => this.emit("protocolError", error));
     child.stdout.on("error", (error: Error) => this.emit("protocolError", error));
     child.once("error", (error: Error) => {
       if (this.process !== child) return;
@@ -104,6 +109,7 @@ export class AppServerClient extends EventEmitter {
     this.initialized = false;
     this.connectedAt = undefined;
     this.process = undefined;
+    this.pendingAppServerRequests.clear();
     for (const [id, pending] of this.pendingOutbound) {
       clearTimeout(pending.timer);
       pending.reject(new Error("app-server stopped"));
@@ -111,7 +117,13 @@ export class AppServerClient extends EventEmitter {
     }
     if (child) {
       this.intentionalStops.add(child);
-      try { child.kill(); } catch { /* already exited */ }
+      await new Promise<void>((resolve) => {
+        const fallback = setTimeout(() => { try { child.kill(); } catch { /* exited */ } }, 1000);
+        const timer = setTimeout(resolve, 6000);
+        child.once("exit", () => { clearTimeout(fallback); clearTimeout(timer); resolve(); });
+        // EOF lets the server dispose its workers and release Windows cwd handles.
+        try { child.stdin.end(); } catch { clearTimeout(fallback); clearTimeout(timer); resolve(); }
+      });
     }
   }
 
@@ -128,10 +140,30 @@ export class AppServerClient extends EventEmitter {
   /** Send a response to a server-initiated request using its original JSON-RPC id. */
   respond(id: JsonRpcId, result?: unknown, error?: JsonRpcErrorShape): void {
     if (!this.process) throw new Error("app-server is not running");
-    const key = String(id);
+    const key = JSON.stringify(id);
+    if (!this.pendingAppServerRequests.has(key)) throw new Error("Server request is no longer pending");
     this.pendingAppServerRequests.delete(key);
     this.write({ jsonrpc: "2.0", id, ...(error ? { error } : { result }) });
     this.emit("serverRequestResponded", id, result, error);
+  }
+
+  /** Pipe acceptance is not app-server acknowledgement. Never retry an uncertain write. */
+  async respondChecked(id: JsonRpcId, result: unknown, connectionId: string, rpcError?: JsonRpcErrorShape): Promise<void> {
+    const child = this.process;
+    const key = JSON.stringify(id);
+    if (!child || !this.initialized || this.epoch !== connectionId || !this.pendingAppServerRequests.has(key)) {
+      throw new Error("Stale connection or resolved server request");
+    }
+    this.pendingAppServerRequests.delete(key);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Response delivery uncertain: pipe timeout")), 10_000);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...(rpcError ? { error: rpcError } : { result }) })}\n`, "utf8", (error) => {
+        clearTimeout(timer);
+        if (error || this.process !== child) reject(error ?? new Error("Connection changed during response"));
+        else resolve();
+      });
+    });
+    this.emit("serverRequestResponded", id, result);
   }
 
   private requestInternal(method: string, params: unknown, isInitialize: boolean): Promise<any> {
@@ -139,7 +171,7 @@ export class AppServerClient extends EventEmitter {
       return Promise.reject(new Error("app-server initialize must complete before other requests"));
     }
     const id = this.nextRequestId++;
-    const key = String(id);
+    const key = JSON.stringify(id);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingOutbound.delete(key);
@@ -191,7 +223,7 @@ export class AppServerClient extends EventEmitter {
     const hasId = Object.prototype.hasOwnProperty.call(message, "id") && message.id !== null;
     const hasMethod = typeof message.method === "string";
     if (hasId && !hasMethod && (Object.prototype.hasOwnProperty.call(message, "result") || Object.prototype.hasOwnProperty.call(message, "error"))) {
-      const key = String(message.id);
+      const key = JSON.stringify(message.id);
       const pending = this.pendingOutbound.get(key);
       if (!pending) {
         this.emit("protocolError", new Error(`Response for unknown request id ${key}`), message);
@@ -212,11 +244,12 @@ export class AppServerClient extends EventEmitter {
     }
     if (hasMethod && hasId) {
       const request = message as JsonRpcServerRequest;
-      this.pendingAppServerRequests.set(String(request.id), request);
+      this.pendingAppServerRequests.set(JSON.stringify(request.id), request);
       this.emit("serverRequest", request);
       return;
     }
     if (hasMethod) {
+      if (message.method === "serverRequest/resolved") this.pendingAppServerRequests.delete(JSON.stringify(message.params?.requestId));
       this.emit("notification", message as JsonRpcNotification);
       return;
     }
@@ -226,13 +259,13 @@ export class AppServerClient extends EventEmitter {
   private handleExit(child: AppServerProcessLike, code: number | null, signal: NodeJS.Signals | null): void {
     const intentional = this.intentionalStops.has(child);
     if (this.process && this.process !== child) {
-      this.emit("processExit", { code, signal, intentional: true });
       return;
     }
     this.process = undefined;
     this.initialized = false;
     this.connectedAt = undefined;
     this.lineBuffer = "";
+    this.pendingAppServerRequests.clear();
     for (const [id, pending] of this.pendingOutbound) {
       clearTimeout(pending.timer);
       pending.reject(new Error(`app-server exited (code=${code ?? "null"}, signal=${signal ?? "none"})`));

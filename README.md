@@ -1,4 +1,4 @@
-# Codex Bridge
+# Codex Bridge 0.3
 
 Codex Bridge is a local stdio MCP server that lets ChatGPT supervise the real Codex runtime and receive project artifacts without exposing a second shell, Git, SSH, or model loop.
 
@@ -11,6 +11,8 @@ ChatGPT GPT Pro
 ```
 
 The MCP layer manages Codex threads, turns, events, approvals, questions, recovery, and delivery evidence. A read-only artifact layer also lets ChatGPT browse and transfer files from configured projects for inspection, inline preview, and download. Codex remains responsible for project writes, commands, Git, SSH, MCP tools, research work, and its final natural-language answer.
+
+Version **0.3.0** adds a Web-side tool relay: Codex requests a capability through the native `bridge_web_tool` dynamic tool; ChatGPT uses a tool it actually has, returns text/JSON/sources, and Codex continues **the same turn**. No browser automation, cookie reuse, connector credentials, or second model loop is involved. Capability names are not restricted to a fixed connector list; actual availability and authorization remain with the ChatGPT host.
 
 ## Requirements and setup
 
@@ -65,6 +67,7 @@ machine has multiple Codex installations, set the local (never ChatGPT-provided)
 - `codex_status`: immediate task status, or active/recent task recovery list.
 - `codex_send`: `turn/steer` an active turn or start a new turn on the same completed/lost thread.
 - `codex_respond`: validate and answer approvals, permissions, user input and MCP elicitations with the original JSON-RPC request ID.
+- `codex_submit_tool_result`: return a truthful Web-side tool result to the original pending dynamic-tool request; this can advance consequential Codex work.
 - `codex_result`: return an authoritative terminal delivery, Codex's natural-language final message, and independent evidence.
 - `codex_inspect`: paginate transcript, plan, diff, commands, bounded output, file changes, MCP calls, warnings, or redacted raw events.
 - `codex_cancel`: send `turn/interrupt` and wait for authoritative `turn/completed`.
@@ -87,6 +90,54 @@ and attach the original CSV for download. Do not start a Codex task.
 
 `turn/start` never contains `outputSchema`; prompts and final answers remain ordinary natural language. No tool response invents percentage progress. Only `turn/completed` makes the current turn terminal.
 
+## Web-side tool relay
+
+```text
+codex_start -> codex_wait -> tool_requests[]
+  -> ChatGPT uses an available, authorized Web-side tool
+  -> codex_submit_tool_result -> Codex continues the original turn
+  -> codex_wait (repeat) -> turn/completed -> codex_result
+```
+
+New threads register the fixed `bridge_web_tool` through `thread/start.dynamicTools`. Codex supplies `capability`, `request` (up to 16,000 characters), optional JSON `context`, and `operation: read|write`. Total request arguments are limited to 20,000 characters. Native `item/tool/call` drives the queue, not commentary parsing. `codex_wait` wakes immediately and exposes `tool_requests`; `waiting_for_tool` is nonterminal. Approvals/questions remain in `pending_request` (first) and `pending_requests` (queue). Multiple tasks and out-of-order replies are supported.
+
+Example submission (source identifiers below are illustrative, not real research findings):
+
+```json
+{
+  "task_id": "<task ID>",
+  "request_id": "<relay request UUID from codex_wait>",
+  "status": "success",
+  "result": {"summary": "Findings actually returned by the host tool"},
+  "sources": [{"document_id": "<connector document ID>", "title": "Source document"}],
+  "tool_used": "<actual host tool name>"
+}
+```
+
+`result` accepts text or JSON. `sources` accepts strings (links, document IDs or DOIs) or objects with `url`, `document_id`, `doi`, and optional `title`. `status` is `success`, `error`, `unavailable`, or `declined`. If a tool is absent or lacks permission, return an honest failure explanation and keep waiting; never invent a successful lookup. Responses use the schema-native `{contentItems: [{type: "inputText", text: ...}], success}` envelope and original JSON-RPC ID. Submission does not start, steer or resume a turn.
+
+Local defaults (no existing configuration changes are required):
+
+```toml
+[relay]
+enabled = true
+max_result_bytes = 262144 # 256 KiB, entire submitted status/result/sources/tool_used
+```
+
+Oversize results fail explicitly, without silent truncation. Stored results can be read in full using `codex_inspect(kind="tool_requests", item_id="<relay request UUID>", offset=0, limit=8)`: pages contain character chunks; concatenate `text` and follow `next_offset`. Result evidence uses bounded excerpts and labels Web-side results **host reports, not independently verified evidence**. Authoritative app-server dynamic-tool events are recorded separately.
+
+The SQLite migration retains existing tasks/events and adds a queued interaction ledger plus a per-thread relay flag. Each interaction binds its original typed JSON-RPC ID to a connection UUID, thread, turn and call. Identical repeat submissions return the recorded delivery state without resending; conflicting submissions fail. `submitted` means accepted by the local pipe, not independent confirmation of a remote write. `resolved` comes from a server request-resolution or dynamic-tool completion event. Pending requests become `stale` after cancellation, completion or connection loss; interrupted sends become `uncertain`. Never automatically redo a Web-side write after uncertain delivery. Restart preserves these records but does not replay old RPC IDs.
+
+Already registered dynamic tools survive `thread/resume`. Legacy threads without this registration remain readable and continuable but **cannot gain the relay by resume**: create a new task. This follows the locally verified Codex **0.151.0 experimental schema**, where `thread/resume` has no dynamic-tools registration field. Future Codex updates may require re-verification; see the [official app-server documentation](https://developers.openai.com/codex/app-server).
+
+Example prompts for ChatGPT:
+
+- Literature search: “Start a new Codex task for project default. Ask Codex to request current cross-centre ECG model literature through bridge_web_tool. Use your available search tool, return sourced summaries and DOIs, and wait for Codex's evidence-backed delivery.”
+- Connector read: “Ask Codex what context it needs from the project planning document. Read the specified document with the available connector, return only relevant non-sensitive passages and the document ID, then continue waiting.”
+- Authorized write: “I authorize adding this exact comment to issue `<specified issue>`: `<approved text>`. If Codex requests that operation, use the available GitHub connector and host approval flow, return its actual response/link, then wait for completion. Do not perform other writes.”
+
+A Codex request is **not** authorization to send email, publish content, delete data or modify remote systems. ChatGPT must obey the original user scope and host approvals. Redaction is heuristic, not a guarantee that arbitrary clinical data is safe: send only necessary non-sensitive context, never raw patient records or credentials.
+
 ## Doctor, tests, and protocol verification
 
 ```bash
@@ -100,7 +151,7 @@ This implementation was verified against schemas generated by the locally instal
 
 ```bash
 codex --version
-codex app-server generate-ts --out <temporary-directory>
+codex app-server generate-ts --experimental --out <temporary-directory>
 codex app-server generate-json-schema --out <temporary-directory>
 ```
 
@@ -119,6 +170,16 @@ $env:CODEX_SUPERVISOR_REAL_INTEGRATION = "1"
 npm run integration
 ```
 
+The separate opt-in relay fixture consumes a small real Codex turn. It creates a temporary Git project, returns a random marker through a native tool call, and checks that the original turn's final answer contains that marker. The local responder is explicitly a **fixture, not Web search**:
+
+```powershell
+$env:CODEX_SUPERVISOR_RELAY_INTEGRATION = "1"
+npm run integration
+Remove-Item Env:CODEX_SUPERVISOR_RELAY_INTEGRATION
+```
+
+Linux: `CODEX_SUPERVISOR_RELAY_INTEGRATION=1 npm run integration`. Ordinary `npm test` runs no paid model turns. A real ChatGPT Web connector/search loop is a separate acceptance check: refresh the App, start a new task, have Codex request a genuine search, invoke the host search tool, submit actual citations, and verify the final same-turn delivery. Local fixtures do not verify that host workflow or the host's willingness/ability to follow the wait rule.
+
 Test tool discovery with MCP Inspector from the project directory:
 
 ```bash
@@ -130,6 +191,8 @@ For a non-UI tool-list smoke check:
 ```bash
 npx @modelcontextprotocol/inspector --cli node /absolute/path/to/codex-bridge/dist/index.js --method tools/list
 ```
+
+Read-only invocation check: append `--method tools/call --tool-name codex_status` instead of `--method tools/list`. To keep diagnostics separate from a running deployment, explicitly pass `CODEX_SUPERVISOR_STATE=:memory:` to the server in the Inspector session configuration's `env` object (do not assume it inherits all terminal variables). Unit tests also discover and call the relay over the official MCP in-memory transport. Inspector strict schema review may warn about free-form object values/array elements in `result`; accepting arbitrary JSON there is intentional, with runtime nesting and byte limits.
 
 ## Secure MCP Tunnel and ChatGPT
 
@@ -152,14 +215,22 @@ tunnel-client run \
   --profile codex-bridge
 ```
 
-In ChatGPT on the web, enable Developer mode, create a developer App, select the configured Tunnel, refresh both tools and server instructions, and enable the App in the GPT Pro conversation. The embedded server instructions require GPT Pro to stay in the same response and repeatedly call `codex_wait`, resolve safe requests, wait for authoritative `turn/completed`, then call `codex_result` and inspect objective evidence before replying to the user. After upgrading Codex Bridge, restart `tunnel-client run` and refresh the App's tools/resources so ChatGPT sees the new artifact tools and viewer.
+In ChatGPT on the web, enable Developer mode, create a developer App, select the configured Tunnel, refresh both tools and server instructions, and enable the App in the GPT Pro conversation. The embedded server instructions require GPT Pro to stay in the same response and repeatedly call `codex_wait`, resolve safe requests, wait for authoritative `turn/completed`, then call `codex_result` and inspect objective evidence before replying to the user. After upgrading Codex Bridge, stop the old Tunnel with Ctrl+C when its work is finished, restart it and refresh the App's tools and server instructions. Confirm `codex_submit_tool_result` is listed, then create a new task.
+
+Existing Windows installations with the private `.supervisor/start-tunnel.ps1` launcher can keep their one-command startup:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\absolute\path\to\codex-bridge\.supervisor\start-tunnel.ps1"
+```
+
+That launcher, its project/model/Tunnel mappings and DPAPI-encrypted key are local deployment files, not shipped or changed by this update. Other installations use their existing `tunnel-client run --profile <profile>` command. Do not run two supervisors against the same state database.
 
 ## Security boundaries
 
 - Project paths and profiles are local allowlists; MCP inputs cannot provide arbitrary absolute paths, providers, or process commands.
 - Artifact paths are relative to an allowlisted project. Lexical traversal and symlinks/junctions that resolve outside the project are rejected. Configured `sensitive_paths` remain unavailable for transfer.
 - Artifact transfer is read-only, has no extension whitelist, and uses the locally configurable `max_artifact_bytes` transport bound to prevent unbounded JSONL/base64 messages.
-- Start/send/respond/cancel are accurately marked mutating and potentially destructive; health/status/wait/result/inspect are read-only.
+- Start/send/respond/submit-tool-result/cancel are accurately marked mutating and potentially destructive; health/status/wait/result/inspect are read-only.
 - Approval is never globally automatic. High-risk commands, project-external grants, credential-like requests, and arbitrary dynamic tool execution are declined or restricted.
 - Built-in and configurable redaction removes common tokens, private keys, passwords, sensitive paths, and credential fields. Raw reasoning text deltas are not persisted or returned.
 - Command output, artifact size, and pages are bounded. Completed command exit codes, file-change status, MCP status, aggregated diff, and fixed read-only Git checks form the evidence returned by `codex_result`.

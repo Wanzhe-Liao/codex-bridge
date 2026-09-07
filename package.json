@@ -1,6 +1,6 @@
 {
   "name": "codex-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A stdio MCP bridge for ChatGPT to supervise local Codex and transfer project artifacts.",
   "license": "MIT",
   "repository": {

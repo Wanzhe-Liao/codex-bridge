@@ -21,6 +21,11 @@ network_access = true
 # Optional cap for wait long-polls (seconds).
 wait_timeout_seconds = 40
 
+[relay]
+# Applies to newly created threads. Existing registered tools survive resume.
+enabled = true
+max_result_bytes = 262144
+
 [redaction]
 # Additional case-insensitive regexes and path fragments to redact from output.
 redaction_patterns = []

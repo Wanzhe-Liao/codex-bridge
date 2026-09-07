@@ -17,10 +17,11 @@ import {
   type SupervisorConfig,
 } from "./config.js";
 import { boundedExcerpt, redactJson, redactText, redactValue } from "./redaction.js";
-import { pendingRequestFor, pendingRequestJson, responseForPending, type PendingRequestDetail } from "./request-resolver.js";
+import { pendingRequestFor, responseForPending, type PendingRequestDetail } from "./request-resolver.js";
 import { StateStore, type StoredEvent, type StoredTask } from "./store.js";
+import { BRIDGE_WEB_TOOL, checkedSubmission, canonicalJson, publicToolRequest, relayArguments, type Interaction } from "./relay.js";
 
-export type TaskState = "starting" | "running" | "waiting_for_approval" | "waiting_for_input" | "completed" | "failed" | "interrupted" | "connection_lost";
+export type TaskState = "starting" | "running" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_input" | "completed" | "failed" | "interrupted" | "connection_lost";
 export const TERMINAL_STATES: ReadonlySet<TaskState> = new Set(["completed", "failed", "interrupted"]);
 
 export interface TaskStartResult {
@@ -46,6 +47,9 @@ export interface TaskSnapshot {
   codex_messages: string[];
   events: Array<Record<string, unknown>>;
   pending_request: Record<string, unknown> | null;
+  pending_requests: Record<string, unknown>[];
+  tool_requests: Record<string, unknown>[];
+  relay_enabled: boolean;
   warnings: string[];
   error: string | null;
   final_text?: string;
@@ -64,6 +68,8 @@ interface RuntimeTask extends Omit<StoredTask, "state"> {
   finalCandidates: Array<{ text: string; phase: unknown }>;
   revision: number;
   recoveryAttempted?: boolean;
+  cancelRequested?: boolean;
+  threadConnectionId?: string;
 }
 
 function rec(value: unknown): Record<string, unknown> {
@@ -97,7 +103,7 @@ function boundedMessage(text: string): string {
 }
 
 function asTaskState(value: string): TaskState {
-  const allowed: TaskState[] = ["starting", "running", "waiting_for_approval", "waiting_for_input", "completed", "failed", "interrupted", "connection_lost"];
+  const allowed: TaskState[] = ["starting", "running", "waiting_for_tool", "waiting_for_approval", "waiting_for_input", "completed", "failed", "interrupted", "connection_lost"];
   return (allowed as string[]).includes(value) ? value as TaskState : "connection_lost";
 }
 
@@ -128,6 +134,7 @@ export class TaskManager extends EventEmitter {
   private connecting?: Promise<void>;
   private recovering = false;
   private modelCatalog?: Array<Record<string, unknown>>;
+  private readonly interactions = new Map<string, Interaction>();
 
   constructor(client: AppServerClient, store: StateStore, config: SupervisorConfig = loadConfig()) {
     super();
@@ -166,6 +173,7 @@ export class TaskManager extends EventEmitter {
       serviceName: "chatgpt_web_codex_supervisor",
       sessionStartSource: "startup",
       threadSource: "chatgpt_web_codex_supervisor",
+      ...(this.config.relay?.enabled !== false ? { dynamicTools: [BRIDGE_WEB_TOOL] } : {}),
     }));
     const thread = rec(threadResponse.thread);
     const threadId = stringId(thread.id);
@@ -176,7 +184,7 @@ export class TaskManager extends EventEmitter {
       taskId, projectId, profile: profile.id, threadId, sessionId: stringId(thread.sessionId), currentTurnId: null,
       state: "starting", terminal: false, createdAt: now, updatedAt: now, startedAt: now, lastActivityAt: now, finalText: null, error: null,
       project, profileConfig: profile, currentPlan: [], currentActivity: "Thread started", messages: [], warnings: [], latestDiff: null,
-      finalCandidates: [], revision: 0,
+      finalCandidates: [], revision: 0, relayEnabled: this.config.relay?.enabled !== false, threadConnectionId: this.client.connectionId,
     };
     this.tasks.set(taskId, task);
     this.threadToTask.set(threadId, taskId);
@@ -200,7 +208,7 @@ export class TaskManager extends EventEmitter {
       task.currentTurnId = turnId;
       // A very fast turn/completed or approval request can arrive while the
       // turn/start response is resolving. Never overwrite authoritative state.
-      if (!task.terminal && !task.pending) task.state = "running";
+      if (!task.terminal) { task.state = "running"; this.refreshPending(task); }
       this.turnToTask.set(turnId, taskId);
       this.persistTask(task);
       this.signal(task);
@@ -220,9 +228,14 @@ export class TaskManager extends EventEmitter {
     if (message.length > this.config.maxInputLength) throw new Error(`message exceeds ${this.config.maxInputLength} characters`);
     await this.ensureConnected();
     if (!task.threadId) throw new Error("task has no thread_id");
+    if (task.threadConnectionId !== this.client.connectionId) {
+      await this.client.request("thread/resume", { threadId: task.threadId });
+      task.threadConnectionId = this.client.connectionId;
+    }
     if (task.currentTurnId && !task.terminal && task.state !== "connection_lost") {
       await this.client.request("turn/steer", { threadId: task.threadId, expectedTurnId: task.currentTurnId, input: [{ type: "text", text: message, text_elements: [] }] });
       task.state = "running";
+      this.refreshPending(task);
       task.error = null;
       task.currentActivity = "Supervisor steered the active turn";
       this.persistTask(task);
@@ -237,6 +250,8 @@ export class TaskManager extends EventEmitter {
     task.error = null;
     task.finalText = null;
     task.finalCandidates = [];
+    task.cancelRequested = false;
+    task.currentTurnId = null;
     this.persistTask(task);
     let response: Record<string, unknown>;
     try {
@@ -260,7 +275,7 @@ export class TaskManager extends EventEmitter {
     const turnId = stringId(rec(response.turn).id);
     if (!turnId) throw new Error("app-server turn/start response did not contain turn.id");
     task.currentTurnId = turnId;
-    if (!task.terminal && !task.pending) task.state = "running";
+    if (!task.terminal) { task.state = "running"; this.refreshPending(task); }
     task.currentActivity = "New turn started on the existing thread";
     this.turnToTask.set(turnId, taskId);
     this.persistTask(task);
@@ -270,31 +285,99 @@ export class TaskManager extends EventEmitter {
 
   async respond(taskId: string, requestId: string | number, action: string, payload?: unknown): Promise<Record<string, unknown>> {
     const task = this.requireTask(taskId);
-    const requestKey = String(requestId);
-    const detail = task.pending && String(task.pending.requestId) === requestKey ? task.pending : this.loadPendingDetail(task, requestKey);
-    if (!detail) throw new Error(`No pending request ${requestKey} for task ${taskId}`);
-    await this.ensureConnected();
-    if ((detail.kind === "auth_token_request" || detail.kind === "attestation_request") && action === "decline") {
-      this.client.respond(detail.requestId, undefined, { code: -32_001, message: "Declined by Codex supervisor: credential-like client response is not available" });
-    } else {
-      const response = responseForPending(detail, action, payload, { projectCwd: task.project.cwd });
-      this.client.respond(detail.requestId, response);
-    }
-    this.store.resolvePendingRequest(taskId, requestKey);
-    task.pending = undefined;
-    if (!task.terminal) task.state = "running";
+    const interaction = [...this.interactions.values()].find((r) => r.taskId === taskId && r.kind === "approval" && r.rpcId === requestId && r.state === "pending");
+    const detail = interaction?.detail;
+    if (!detail || !interaction) throw new Error(`No pending request for task ${taskId}`);
+    this.validateInteraction(task, interaction);
+    const credentialDecline = (detail.kind === "auth_token_request" || detail.kind === "attestation_request") && action === "decline";
+    const response = credentialDecline ? undefined : responseForPending(detail, action, payload, { projectCwd: task.project.cwd });
+    interaction.submission = redactValue({ action, response }, this.config);
+    interaction.state = "sending";
+    this.saveInteraction(interaction);
+    try {
+      await this.client.respondChecked(detail.requestId, response, interaction.connectionId, credentialDecline ? { code: -32001, message: "Credential-like response declined" } : undefined);
+      if ((interaction.state as string) === "sending") interaction.state = "submitted";
+    } catch { interaction.state = "uncertain"; }
+    this.saveInteraction(interaction);
+    this.refreshPending(task);
     task.currentActivity = `Supervisor responded to ${detail.kind}`;
     task.error = null;
     this.appendSyntheticEvent(task, detail.method, detail.kind === "user_input" ? "user_input_responded" : "approval_responded", { request_id: detail.requestId, action });
     this.persistTask(task);
     this.signal(task);
-    return { task_id: taskId, request_id: detail.requestId, state: task.state, terminal: task.terminal, resolved: true };
+    return { task_id: taskId, request_id: detail.requestId, state: task.state, terminal: task.terminal, resolved: interaction.state !== "uncertain", delivery_state: interaction.state };
+  }
+
+  async submitToolResult(taskId: string, requestId: string, input: unknown): Promise<Record<string, unknown>> {
+    const task = this.requireTask(taskId);
+    const r = this.interactions.get(requestId);
+    if (!r || r.taskId !== taskId || r.kind !== "relay") throw new Error("Unknown tool request for this task");
+    const { safe, canonical } = checkedSubmission(input, this.config);
+    const fingerprint = crypto.createHash("sha256").update(canonical).digest("hex");
+    if (r.fingerprint) {
+      if (r.fingerprint !== fingerprint) throw new Error("Conflicting duplicate tool result");
+      return { task_id: taskId, request_id: r.id, delivery_state: r.state, duplicate: true, terminal: task.terminal,
+        warning: r.state === "uncertain" || r.state === "sending" ? "Delivery is uncertain; do not repeat the Web-side operation." : undefined };
+    }
+    this.validateInteraction(task, r);
+    r.fingerprint = fingerprint;
+    r.submission = safe;
+    r.state = "sending";
+    this.saveInteraction(r);
+    try {
+      await this.client.respondChecked(r.rpcId, { contentItems: [{ type: "inputText", text: JSON.stringify({ provenance: "web_host_submitted_not_independently_verified", ...safe }) }], success: safe.status === "success" }, r.connectionId);
+      // A completion notification may have arrived before the pipe callback.
+      if ((r.state as string) === "sending") r.state = "submitted";
+    } catch {
+      r.state = "uncertain";
+    }
+    this.saveInteraction(r);
+    this.appendSyntheticEvent(task, "bridge/toolResult", "web_tool_result_submitted", { request_id: r.id, turn_id: r.turnId, status: safe.status, delivery_state: r.state, provenance: "web_host_report_not_independently_verified", tool_used: safe.tool_used ?? null });
+    this.refreshPending(task);
+    this.persistTask(task);
+    this.signal(task);
+    return { task_id: taskId, request_id: r.id, turn_id: r.turnId, delivery_state: r.state, terminal: task.terminal,
+      ...(r.state === "uncertain" ? { warning: "Response delivery is uncertain. Do not repeat a Web-side write; inspect state or cancel/steer safely." } : {}) };
+  }
+
+  private validateInteraction(task: RuntimeTask, r: Interaction): void {
+    if (task.terminal || task.cancelRequested || task.state === "connection_lost" || r.state !== "pending" || r.turnId !== task.currentTurnId || r.threadId !== task.threadId ||
+        r.connectionId !== this.client.connectionId || !this.client.isInitialized || !this.client.pendingServerRequests.has(JSON.stringify(r.rpcId))) {
+      throw new Error("Stale, cancelled, resolved or mismatched task/turn/connection request");
+    }
+  }
+
+  private saveInteraction(r: Interaction): void {
+    r.updatedAt = new Date().toISOString();
+    this.interactions.set(r.id, r);
+    this.store.saveInteraction(r.id, r.taskId, { ...r, detail: redactValue(r.detail, this.config), request: redactValue(r.request, this.config), submission: redactValue(r.submission, this.config) });
+  }
+
+  private openInteractions(task: RuntimeTask): Interaction[] {
+    return [...this.interactions.values()].filter((r) => r.taskId === task.taskId && r.turnId === task.currentTurnId && r.state === "pending");
+  }
+
+  private refreshPending(task: RuntimeTask): void {
+    const pending = this.openInteractions(task);
+    task.pending = pending.find((r) => r.kind === "approval")?.detail;
+    if (task.terminal || task.state === "connection_lost") return;
+    task.state = task.pending ? (task.pending.kind === "user_input" ? "waiting_for_input" : "waiting_for_approval") : pending.some((r) => r.kind === "relay") ? "waiting_for_tool" : "running";
+  }
+
+  private invalidateInteractions(task: RuntimeTask): void {
+    for (const r of this.interactions.values()) if (r.taskId === task.taskId && ["pending", "sending"].includes(r.state)) {
+      r.state = r.state === "sending" ? "uncertain" : "stale";
+      this.saveInteraction(r);
+    }
+    this.refreshPending(task);
   }
 
   async cancel(taskId: string, reason?: string): Promise<TaskSnapshot> {
     const task = this.requireTask(taskId);
     if (task.terminal || !task.currentTurnId || !task.threadId) return this.snapshot(task, String(this.store.latestSequence(taskId)), []);
     await this.ensureConnected();
+    task.cancelRequested = true;
+    this.invalidateInteractions(task);
     try {
       await this.client.request("turn/interrupt", { threadId: task.threadId, turnId: task.currentTurnId });
     } catch (error) {
@@ -320,7 +403,7 @@ export class TaskManager extends EventEmitter {
     const deadline = Date.now() + timeout;
     while (true) {
       const events = this.store.eventsAfter(taskId, currentCursor, this.config.maxPageSize);
-      if (events.length > 0 || task.terminal || task.pending) {
+      if (events.length > 0 || task.terminal || this.openInteractions(task).length) {
         const next = events.length ? events[events.length - 1].sequence : currentCursor;
         return this.snapshot(task, String(currentCursor), events, String(next));
       }
@@ -375,6 +458,12 @@ export class TaskManager extends EventEmitter {
     let rows: Array<Record<string, unknown>>;
     switch (kind) {
       case "transcript": rows = stored.filter((e) => ["agent_message", "reasoning_summary"].includes(e.eventType)).map(eventPublic); break;
+      case "tool_requests": rows = [...this.interactions.values()].filter((r) => r.taskId === taskId && r.kind === "relay" && (!itemId || r.id === itemId || r.callId === itemId)).flatMap((r) => {
+        const content = JSON.stringify({ ...publicToolRequest(r), submission: r.submission ?? null, provenance: "web_host_report_not_independently_verified" });
+        const chunks: Record<string, unknown>[] = [];
+        for (let i = 0; i < content.length; i += 4000) chunks.push({ request_id: r.id, character_offset: i, text: content.slice(i, i + 4000), total_characters: content.length });
+        return chunks;
+      }); break;
       case "plan": rows = stored.filter((e) => e.eventType === "plan_updated" || e.eventType === "plan_delta").map(eventPublic); break;
       case "diff": rows = stored.filter((e) => e.eventType === "diff_updated").map(eventPublic); break;
       case "commands": rows = stored.filter((e) => e.eventType === "command_started" || e.eventType === "command_completed").map(eventPublic); break;
@@ -385,7 +474,7 @@ export class TaskManager extends EventEmitter {
       case "raw_event": rows = stored.slice().map((e) => ({ sequence: e.sequence, method: e.method, item_id: e.itemId, event_type: e.eventType, raw_event: e.rawJsonRedacted, created_at: e.createdAt })); break;
       default: throw new Error(`Unknown inspect kind: ${kind}`);
     }
-    const page = rows.slice(safeOffset, safeOffset + safeLimit);
+    const page = rows.slice(safeOffset, safeOffset + (kind === "tool_requests" ? Math.min(safeLimit, 8) : safeLimit));
     return { task_id: taskId, kind, item_id: itemId ?? null, offset: safeOffset, limit: safeLimit, total: rows.length, next_offset: safeOffset + page.length < rows.length ? safeOffset + page.length : null, data: page };
   }
 
@@ -432,10 +521,19 @@ export class TaskManager extends EventEmitter {
       if (task.threadId) this.threadToTask.set(task.threadId, task.taskId);
       if (task.currentTurnId) this.turnToTask.set(task.currentTurnId, task.taskId);
       for (const event of this.store.recentEvents(task.taskId, 5_000)) this.replayEvent(task, event);
-      const pending = this.store.getPendingRequest(task.taskId);
-      if (pending) {
-        try { task.pending = JSON.parse(pending.requestJsonRedacted) as PendingRequestDetail; } catch { /* no-op */ }
+      task.terminal = stored.terminal;
+      task.state = stored.terminal ? asTaskState(stored.state) : "connection_lost";
+      task.currentTurnId = stored.currentTurnId;
+      task.finalText = stored.finalText;
+      task.updatedAt = stored.updatedAt;
+      for (const row of this.store.interactions(task.taskId)) {
+        const r = row as Interaction;
+        if (r.state === "sending") r.state = "uncertain";
+        else if (r.state === "pending") r.state = "stale";
+        this.saveInteraction(r);
       }
+      if (!task.relayEnabled) task.warnings.push("This legacy thread has no bridge_web_tool registration. Start a new task to enable Web-side relay; continuing this thread does not migrate it.");
+      this.persistTask(task);
     }
   }
 
@@ -451,6 +549,7 @@ export class TaskManager extends EventEmitter {
             task.recoveryAttempted = true;
             try {
               const response = rec(await this.client.request("thread/resume", { threadId: task.threadId, excludeTurns: true }));
+              task.threadConnectionId = this.client.connectionId;
               const thread = rec(response.thread);
               const turns = Array.isArray(thread.turns) ? thread.turns : [];
               const latest = turns.length ? rec(turns[turns.length - 1]) : {};
@@ -483,9 +582,11 @@ export class TaskManager extends EventEmitter {
   }
 
   private handleProcessExit(info: { code: number | null; signal: NodeJS.Signals | null; intentional: boolean }): void {
+    for (const task of this.tasks.values()) this.invalidateInteractions(task);
     if (info.intentional) return;
     for (const task of this.tasks.values()) {
       if (!task.terminal) {
+        task.recoveryAttempted = false;
         task.state = "connection_lost";
         task.error = `app-server exited (code=${info.code ?? "null"}, signal=${info.signal ?? "none"})`;
         this.appendSyntheticEvent(task, "process/exited", "connection_lost", { code: info.code, signal: info.signal });
@@ -547,10 +648,39 @@ export class TaskManager extends EventEmitter {
     const task = this.tasks.get(taskId);
     if (!task) return;
     const detail = pendingRequestFor(taskId, request, this.config);
-    task.pending = detail;
-    task.state = detail.kind === "user_input" ? "waiting_for_input" : "waiting_for_approval";
+    if (task.terminal || task.cancelRequested || (task.currentTurnId && params.turnId && params.turnId !== task.currentTurnId)) {
+      this.client.respond(request.id, undefined, { code: -32602, message: "No matching active turn" });
+      return;
+    }
+    if (!task.currentTurnId && typeof params.turnId === "string") task.currentTurnId = params.turnId;
+    if ([...this.interactions.values()].some((r) => r.connectionId === this.client.connectionId && r.rpcId === request.id && ["pending", "sending"].includes(r.state))) return;
+    const now = new Date().toISOString();
+    const interaction: Interaction = { id: crypto.randomUUID(), taskId, threadId: task.threadId!, turnId: stringId(params.turnId) ?? task.currentTurnId,
+      callId: stringId(params.callId), rpcId: request.id, connectionId: this.client.connectionId, kind: "approval", state: "pending", createdAt: now, updatedAt: now };
+    if (request.method === "item/tool/call" && params.tool === "bridge_web_tool" && params.namespace == null) {
+      try {
+        if (!task.relayEnabled || this.config.relay?.enabled === false) throw new Error("Web relay is disabled for this thread; start a new task if enabling it");
+        if (!params.turnId || !params.callId) throw new Error("Relay request lacks turn/call identity");
+        if (canonicalJson(params.arguments).length > 20_000) throw new Error("Relay arguments exceed 20000 characters including context");
+        interaction.request = redactValue(relayArguments.parse(params.arguments), this.config) as Interaction["request"];
+        interaction.kind = "relay";
+        this.saveInteraction(interaction);
+        this.appendSyntheticEvent(task, request.method, "external_tool_request", publicToolRequest(interaction));
+        this.refreshPending(task);
+        this.persistTask(task);
+        this.signal(task);
+        return;
+      } catch (error) {
+        this.client.respond(request.id, { contentItems: [{ type: "inputText", text: `Invalid relay request: ${redactText(String(error), this.config).slice(0, 2000)}` }], success: false });
+        this.appendSyntheticEvent(task, request.method, "warning", { message: "Relay request rejected: disabled or invalid arguments" });
+        this.signal(task);
+        return;
+      }
+    }
+    interaction.detail = detail;
+    this.saveInteraction(interaction);
+    this.refreshPending(task);
     task.currentActivity = detail.description;
-    this.store.savePendingRequest({ taskId, requestId: String(request.id), kind: detail.kind, requestJsonRedacted: pendingRequestJson(detail, this.config), resolved: false, createdAt: new Date().toISOString(), resolvedAt: null });
     this.appendSyntheticEvent(task, request.method, detail.kind === "user_input" ? "user_input_requested" : "approval_requested", {
       request_id: request.id, kind: detail.kind, description: detail.description, context: detail.context, allowed_actions: detail.allowedActions, response_contract: detail.responseContract, autoResolutionMs: detail.autoResolutionMs ?? null,
     });
@@ -563,9 +693,10 @@ export class TaskManager extends EventEmitter {
     const taskId = this.threadToTask.get(threadId);
     const task = taskId ? this.tasks.get(taskId) : undefined;
     const orphan = this.orphanNotifications.get(threadId);
-    if (!task || !orphan) return;
+    if (!task) return;
     this.orphanNotifications.delete(threadId);
-    for (const notification of orphan) this.processNotification(task, notification);
+    for (const notification of orphan ?? []) this.processNotification(task, notification);
+    for (const request of this.client.pendingServerRequests.values()) if (rec(request.params).threadId === threadId) this.handleServerRequest(request);
   }
 
   private replayEvent(task: RuntimeTask, stored: StoredEvent, normalized?: NormalizedEvent): void {
@@ -575,7 +706,7 @@ export class TaskManager extends EventEmitter {
     if (eventType === "turn_started") {
       const id = stringId(payload.turn_id);
       if (id) { task.currentTurnId = id; this.turnToTask.set(id, task.taskId); }
-      if (!task.terminal) task.state = "running";
+      if (!task.terminal) { task.state = "running"; this.refreshPending(task); }
       task.currentActivity = "Turn started";
       const started = stringId(payload.started_at);
       if (started) task.startedAt = new Date(Number(started) * 1_000).toISOString();
@@ -590,8 +721,14 @@ export class TaskManager extends EventEmitter {
         task.currentActivity = `Turn ${status}`;
         if (payload.error && rec(payload.error).message) task.error = String(rec(payload.error).message);
         if (task.finalText === null) task.finalText = this.selectFinalText(task);
+        this.invalidateInteractions(task);
       } else {
         task.warnings.push("Received turn/completed without a recognized terminal status");
+      }
+    } else if (eventType === "dynamic_tool_completed") {
+      for (const r of this.interactions.values()) if (r.taskId === task.taskId && r.callId === stored.itemId && r.connectionId === this.client.connectionId && ["sending", "submitted"].includes(r.state)) {
+        r.state = "resolved";
+        this.saveInteraction(r);
       }
     } else if (eventType === "plan_updated") {
       task.currentPlan = Array.isArray(payload.plan) ? payload.plan.map((step) => { const s = rec(step); return { step: String(s.step ?? ""), status: s.status }; }) : [];
@@ -620,10 +757,11 @@ export class TaskManager extends EventEmitter {
       if (typeof payload.message === "string") task.warnings.push(payload.message);
       task.currentActivity = eventType === "error" ? "Codex reported an error" : "Warning received";
     } else if (eventType === "server_request_resolved") {
-      const requestId = stringId(payload.request_id);
-      if (requestId) this.store.resolvePendingRequest(task.taskId, requestId);
-      if (task.pending && (!requestId || String(task.pending.requestId) === requestId)) task.pending = undefined;
-      if (!task.terminal) task.state = "running";
+      for (const r of this.interactions.values()) if (r.taskId === task.taskId && r.rpcId === payload.request_id && r.connectionId === this.client.connectionId && !["stale", "uncertain"].includes(r.state)) {
+        r.state = "resolved";
+        this.saveInteraction(r);
+      }
+      this.refreshPending(task);
     } else if (eventType === "connection_lost") {
       task.state = "connection_lost";
       task.terminal = false;
@@ -671,25 +809,15 @@ export class TaskManager extends EventEmitter {
     return task;
   }
 
-  private loadPendingDetail(task: RuntimeTask, requestId: string): PendingRequestDetail | undefined {
-    const stored = this.store.getPendingRequest(task.taskId, requestId);
-    if (!stored) return undefined;
-    try {
-      const json = JSON.parse(stored.requestJsonRedacted) as Record<string, unknown>;
-      // A restarted process retains a safe description but not unredacted parameters.
-      return {
-        requestId: requestId, taskId: task.taskId, method: String(json.method ?? ""), kind: String(json.kind ?? stored.kind), description: String(json.description ?? ""),
-        context: rec(json.context), allowedActions: Array.isArray(json.allowed_actions) ? json.allowed_actions.filter((v): v is string => typeof v === "string") : ["decline"], responseContract: String(json.response_contract ?? "Decline only."), rawParams: rec(json.raw_params ?? json.context),
-      };
-    } catch { return undefined; }
-  }
-
   private snapshot(task: RuntimeTask, cursor: string, events: StoredEvent[], nextCursor = cursor): TaskSnapshot {
     const snapshot: TaskSnapshot = {
       task_id: task.taskId, thread_id: task.threadId, turn_id: task.currentTurnId, state: task.state, terminal: task.terminal,
       cursor, next_cursor: nextCursor, started_at: task.startedAt, last_activity_at: task.lastActivityAt, current_plan: task.currentPlan,
       current_activity: task.currentActivity, codex_messages: task.messages.slice(-50), events: events.map(eventPublic),
       pending_request: task.pending ? this.publicPending(task.pending) : null, warnings: task.warnings.slice(-50), error: task.error,
+      pending_requests: this.openInteractions(task).filter((r) => r.detail).map((r) => this.publicPending(r.detail!)),
+      tool_requests: this.openInteractions(task).filter((r) => r.kind === "relay").map(publicToolRequest),
+      relay_enabled: task.relayEnabled ?? false,
     };
     if (task.terminal && task.finalText !== null) snapshot.final_text = task.finalText;
     return snapshot;
@@ -700,7 +828,7 @@ export class TaskManager extends EventEmitter {
   }
 
   private taskSummary(task: RuntimeTask): Record<string, unknown> {
-    return { task_id: task.taskId, project_id: task.projectId, profile: task.profile, thread_id: task.threadId, turn_id: task.currentTurnId, state: task.state, terminal: task.terminal, updated_at: task.updatedAt, last_activity_at: task.lastActivityAt, pending_request: task.pending ? this.publicPending(task.pending) : null, error: task.error };
+    return { task_id: task.taskId, project_id: task.projectId, profile: task.profile, thread_id: task.threadId, turn_id: task.currentTurnId, state: task.state, terminal: task.terminal, updated_at: task.updatedAt, last_activity_at: task.lastActivityAt, pending_request: task.pending ? this.publicPending(task.pending) : null, tool_requests: this.openInteractions(task).filter((r) => r.kind === "relay").map(publicToolRequest), relay_enabled: task.relayEnabled ?? false, error: task.error };
   }
 
   private itemEventType(event: StoredEvent): string | null {
@@ -722,6 +850,12 @@ export class TaskManager extends EventEmitter {
       if (typeof p.delta === "string") p.delta = boundedExcerpt(p.delta, this.config.maxCommandOutput).text;
       if (p.item && typeof p.item === "object") {
         const item = p.item as Record<string, unknown>;
+        if (item.type === "dynamicToolCall") {
+          item.arguments_excerpt = boundedExcerpt(JSON.stringify(item.arguments ?? null), 4000);
+          item.content_excerpt = boundedExcerpt(JSON.stringify(item.contentItems ?? null), 4000);
+          delete item.arguments;
+          delete item.contentItems;
+        }
         if (typeof item.aggregatedOutput === "string") item.aggregatedOutput = boundedExcerpt(item.aggregatedOutput, this.config.maxCommandOutput).text;
         if (Array.isArray(item.changes)) item.changes = item.changes.slice(0, 100).map((change) => { const c = rec(change); return { path: c.path, kind: c.kind, diff: boundedExcerpt(typeof c.diff === "string" ? c.diff : "", 800).text }; });
       }
@@ -760,6 +894,8 @@ export class TaskManager extends EventEmitter {
       command_executions: commands,
       file_changes: fileChanges,
       mcp_tool_calls: mcpCalls,
+      web_tool_results: [...this.interactions.values()].filter((r) => r.taskId === task.taskId && r.kind === "relay").slice(-50).map((r) => ({ request_id: r.id, turn_id: r.turnId, delivery_state: r.state, submission_excerpt: boundedExcerpt(JSON.stringify(r.submission ?? null), 2000), inspect_kind: "tool_requests", provenance: "web_host_report_not_independently_verified" })),
+      authoritative_dynamic_tool_events: events.filter((e) => e.eventType === "dynamic_tool_completed").map(eventPublic),
       latest_diff: task.latestDiff,
       git_readonly_checks: gitEvidence,
       warnings,

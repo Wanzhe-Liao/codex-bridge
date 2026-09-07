@@ -7,6 +7,7 @@ export interface MockScenario {
   approval?: "command" | "file" | "input" | "permission" | "elicitation";
   failed?: boolean;
   interrupt?: boolean;
+  relay?: boolean;
 }
 
 function turn(id: string, status: string = "inProgress"): Record<string, unknown> {
@@ -18,7 +19,9 @@ export class MockAppServerProcess extends EventEmitter implements AppServerProce
   readonly stdin: Writable;
   readonly outbound: Record<string, unknown>[] = [];
   readonly scenario: MockScenario;
-  private readonly threadId = "thread-mock-1";
+  private threadId = "thread-mock-1";
+  private threadNumber = 0;
+  private readonly relayCalls = new Map<string, any>();
   private readonly sessionId = "session-mock-1";
   private turnNumber = 0;
   private stopped = false;
@@ -27,6 +30,7 @@ export class MockAppServerProcess extends EventEmitter implements AppServerProce
     super();
     this.scenario = scenario;
     this.stdin = new Writable({
+      final: (callback) => { this.kill(); callback(); },
       write: (chunk, _encoding, callback) => {
         try {
           const lines = chunk.toString().split("\n").filter(Boolean);
@@ -50,6 +54,7 @@ export class MockAppServerProcess extends EventEmitter implements AppServerProce
   }
 
   emitServerRequest(id: string | number, method: string, params: unknown): void {
+    if (method === "item/tool/call") this.relayCalls.set(JSON.stringify(id), params);
     this.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
   }
 
@@ -61,6 +66,18 @@ export class MockAppServerProcess extends EventEmitter implements AppServerProce
     this.outbound.push(message);
     const method = message.method;
     const id = message.id as string | number;
+    if (!method && this.scenario.relay && this.relayCalls.has(JSON.stringify(id))) {
+      const request = this.relayCalls.get(JSON.stringify(id));
+      const response: any = message.result;
+      this.relayCalls.delete(JSON.stringify(id));
+      queueMicrotask(() => {
+        const common = { threadId: request.threadId, turnId: request.turnId };
+        this.emitNotification("item/completed", { ...common, item: { type: "dynamicToolCall", id: request.callId, tool: "bridge_web_tool", status: response.success ? "completed" : "failed", success: response.success } });
+        this.emitNotification("item/completed", { ...common, item: { type: "agentMessage", id: "relay-final", phase: "final_answer", text: `Fixture result received: ${response.contentItems[0].text}` } });
+        this.emitNotification("turn/completed", { threadId: request.threadId, turn: turn(request.turnId, "completed") });
+      });
+      return;
+    }
     if (method === "initialize") {
       this.respond(id, { userAgent: "mock", codexHome: "/tmp/mock", platformFamily: "unix", platformOs: "linux" });
       return;
@@ -74,6 +91,8 @@ export class MockAppServerProcess extends EventEmitter implements AppServerProce
       return;
     }
     if (method === "thread/start") {
+      this.threadNumber++;
+      this.threadId = `thread-mock-${this.threadNumber}`;
       this.respond(id, { thread: { id: this.threadId, sessionId: this.sessionId, turns: [], status: { type: "idle" }, cwd: process.cwd() } });
       queueMicrotask(() => this.emitNotification("thread/started", { thread: { id: this.threadId, sessionId: this.sessionId } }));
       return;
@@ -109,6 +128,10 @@ export class MockAppServerProcess extends EventEmitter implements AppServerProce
   private emitTurn(turnId: string): void {
     this.emitNotification("turn/started", { threadId: this.threadId, turn: turn(turnId) });
     this.emitNotification("turn/plan/updated", { threadId: this.threadId, turnId, explanation: null, plan: [{ step: "Inspect project", status: "inProgress" }, { step: "Deliver", status: "pending" }] });
+    if (this.scenario.relay) {
+      this.emitServerRequest(77, "item/tool/call", { threadId: this.threadId, turnId, callId: "relay-call", namespace: null, tool: "bridge_web_tool", arguments: { capability: "fixture_lookup", request: "Return the test fixture marker", operation: "read" } });
+      return;
+    }
     if (this.scenario.approval) {
       const common = { threadId: this.threadId, turnId, itemId: "item-request-1", startedAtMs: Date.now() };
       if (this.scenario.approval === "command") this.emitServerRequest("server-1", "item/commandExecution/requestApproval", { ...common, kind: "command", environmentId: null, command: "git status --short", cwd: process.cwd(), reason: "mock approval" });

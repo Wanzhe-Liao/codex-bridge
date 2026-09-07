@@ -39,6 +39,7 @@ export interface SupervisorConfig extends RedactionConfig {
   maxCommandOutput: number;
   maxArtifactBytes: number;
   restartAttempts: number;
+  relay?: { enabled: boolean; maxResultBytes: number };
 }
 
 const DEFAULT_MAX_INPUT = 100_000;
@@ -144,6 +145,7 @@ export function loadConfig(filePath = defaultConfigPath()): SupervisorConfig {
     maxCommandOutput: numberValue(parsed.max_command_output, DEFAULT_MAX_OUTPUT, 256, 20_000),
     maxArtifactBytes: numberValue(parsed.max_artifact_bytes, DEFAULT_MAX_ARTIFACT_BYTES, 1_024, 256 * 1024 * 1024),
     restartAttempts: numberValue(parsed.restart_attempts, 2, 0, 5),
+    relay: { enabled: asRecord(parsed.relay).enabled !== false, maxResultBytes: numberValue(asRecord(parsed.relay).max_result_bytes, 256 * 1024, 1024, 16 * 1024 * 1024) },
     redactionPatterns: Array.isArray(patternValues)
       ? patternValues.filter((v: unknown): v is string => typeof v === "string").slice(0, 50)
       : [],
@@ -211,6 +213,7 @@ export function publicConfig(config: SupervisorConfig): Record<string, unknown> 
   return {
     path: config.path,
     exists: config.exists,
+    relay: config.relay ?? { enabled: true, maxResultBytes: 262144 },
     projects: Object.values(config.projects).map(({ id, cwd }) => ({ id, cwd })),
     profiles: Object.values(config.profiles).map((profile) => ({
       id: profile.id,

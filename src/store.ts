@@ -19,6 +19,7 @@ export interface StoredTask {
   lastActivityAt: string | null;
   finalText: string | null;
   error: string | null;
+  relayEnabled?: boolean;
 }
 
 export interface StoredEvent {
@@ -52,7 +53,7 @@ export class StateStore {
   private readonly db: Database.Database;
 
   constructor(filePath?: string) {
-    let selectedPath = filePath === ":memory:" ? ":memory:" : (filePath ? path.resolve(filePath) : statePath());
+    let selectedPath = (filePath ?? process.env.CODEX_SUPERVISOR_STATE) === ":memory:" ? ":memory:" : (filePath ? path.resolve(filePath) : statePath());
     if (selectedPath !== ":memory:") {
       try {
         fs.mkdirSync(path.dirname(selectedPath), { recursive: true, mode: 0o700 });
@@ -110,12 +111,27 @@ export class StateStore {
       );
       CREATE INDEX IF NOT EXISTS pending_task_open_idx ON pending_requests(task_id, resolved);
     `);
+    if (!(this.db.pragma("table_info(tasks)") as Array<{ name: string }>).some((c) => c.name === "relay_enabled")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN relay_enabled INTEGER NOT NULL DEFAULT 0");
+    }
+    this.db.exec(`CREATE TABLE IF NOT EXISTS interactions (
+      id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), body TEXT NOT NULL
+    ); CREATE INDEX IF NOT EXISTS interactions_task ON interactions(task_id);`);
     if (this.path !== ":memory:") {
       try { fs.chmodSync(this.path, 0o600); } catch { /* Windows ACLs are managed by the user. */ }
     }
   }
 
   close(): void { this.db.close(); }
+
+  saveInteraction(id: string, taskId: string, body: unknown): void {
+    this.db.prepare("INSERT INTO interactions(id, task_id, body) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET body=excluded.body")
+      .run(id, taskId, JSON.stringify(body));
+  }
+
+  interactions(taskId: string): unknown[] {
+    return (this.db.prepare("SELECT body FROM interactions WHERE task_id = ? ORDER BY rowid").all(taskId) as Array<{ body: string }>).map((r) => JSON.parse(r.body));
+  }
 
   writable(): boolean {
     try {
@@ -133,6 +149,7 @@ export class StateStore {
       VALUES (@taskId, @projectId, @profile, @threadId, @sessionId, @currentTurnId, @state, @terminal,
         @createdAt, @updatedAt, @startedAt, @lastActivityAt, @finalText, @error)
     `).run({ ...task, terminal: task.terminal ? 1 : 0 });
+    this.updateTask(task.taskId, { relayEnabled: task.relayEnabled ?? false });
   }
 
   updateTask(taskId: string, patch: Partial<Omit<StoredTask, "taskId">>): void {
@@ -142,6 +159,7 @@ export class StateStore {
       projectId: "project_id", profile: "profile", threadId: "thread_id", sessionId: "session_id",
       currentTurnId: "current_turn_id", state: "state", terminal: "terminal", createdAt: "created_at",
       updatedAt: "updated_at", startedAt: "started_at", lastActivityAt: "last_activity_at", finalText: "final_text", error: "error",
+      relayEnabled: "relay_enabled",
     };
     const assignments: string[] = [];
     const values: Record<string, unknown> = { taskId };
@@ -149,7 +167,7 @@ export class StateStore {
       const column = mapping[key];
       if (!column) continue;
       assignments.push(`${column} = @${key}`);
-      values[key] = key === "terminal" ? (value ? 1 : 0) : value;
+      values[key] = key === "terminal" || key === "relayEnabled" ? (value ? 1 : 0) : value;
     }
     if (assignments.length) this.db.prepare(`UPDATE tasks SET ${assignments.join(", ")} WHERE task_id = @taskId`).run(values);
   }
@@ -228,6 +246,7 @@ export class StateStore {
       createdAt: String(row.created_at), updatedAt: String(row.updated_at), startedAt: row.started_at == null ? null : String(row.started_at),
       lastActivityAt: row.last_activity_at == null ? null : String(row.last_activity_at), finalText: row.final_text == null ? null : String(row.final_text),
       error: row.error == null ? null : String(row.error),
+      relayEnabled: Boolean(row.relay_enabled),
     };
   }
 

@@ -57,6 +57,11 @@ function itemPayload(item: Record<string, unknown>, config: RedactionConfig): Re
   if (itemType === "reasoning") {
     return { type: itemType, id: item.id, summary: Array.isArray(item.summary) ? item.summary.map((part) => text(part, 1_000)).slice(0, 20) : [] };
   }
+  if (itemType === "dynamicToolCall") {
+    return { type: itemType, id: item.id, tool: text(item.tool, 256), namespace: item.namespace ?? null,
+      status: item.status, success: item.success ?? null, duration_ms: item.durationMs ?? null,
+      provenance: "app_server_authoritative_item_state" };
+  }
   if (itemType === "plan") return { type: itemType, id: item.id, text: text(item.text) };
   return record(redactValue({ type: itemType, id: item.id, status: item.status }, config));
 }
@@ -89,7 +94,7 @@ export function normalizeNotification(method: string, rawParams: unknown, config
   if (method === "item/started") {
     const item = record(params.item);
     const itemType = String(item.type ?? "item");
-    const eventType = itemType === "commandExecution" ? "command_started" : itemType === "fileChange" ? "file_change_started" : itemType === "mcpToolCall" ? "mcp_tool_started" : "item_started";
+    const eventType = itemType === "dynamicToolCall" ? "dynamic_tool_started" : itemType === "commandExecution" ? "command_started" : itemType === "fileChange" ? "file_change_started" : itemType === "mcpToolCall" ? "mcp_tool_started" : "item_started";
     return { method, eventType, threadId, turnId, itemId, payload: itemPayload(item, config), meaningful: true, authoritative: false };
   }
   if (method === "item/completed") {
@@ -97,7 +102,7 @@ export function normalizeNotification(method: string, rawParams: unknown, config
     const payload = itemPayload(item, config);
     const finalText = item.type === "agentMessage" && typeof item.text === "string" ? redactText(item.text, config) : undefined;
     const itemType = String(item.type ?? "item");
-    const eventType = itemType === "commandExecution" ? "command_completed" : itemType === "fileChange" ? "file_change_completed" : itemType === "mcpToolCall" ? "mcp_tool_completed" : itemType === "agentMessage" ? "agent_message" : itemType === "reasoning" ? "reasoning_summary" : "item_completed";
+    const eventType = itemType === "dynamicToolCall" ? "dynamic_tool_completed" : itemType === "commandExecution" ? "command_completed" : itemType === "fileChange" ? "file_change_completed" : itemType === "mcpToolCall" ? "mcp_tool_completed" : itemType === "agentMessage" ? "agent_message" : itemType === "reasoning" ? "reasoning_summary" : "item_completed";
     return { method, eventType, threadId, turnId, itemId, payload, meaningful: true, authoritative: true, ...(finalText === undefined ? {} : { finalText }) };
   }
   if (method === "item/agentMessage/delta") {

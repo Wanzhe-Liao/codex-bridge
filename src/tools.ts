@@ -5,6 +5,7 @@ import { ARTIFACT_WIDGET_HTML, ARTIFACT_WIDGET_URI } from "./artifact-widget.js"
 import { decodeArtifactResourceToken, isTextMime, listArtifacts, loadArtifact } from "./artifacts.js";
 import type { TaskManager } from "./task-manager.js";
 import { VERSION } from "./version.js";
+import { RELAY_RULE, relaySubmission } from "./relay.js";
 
 export const SUPERVISOR_INSTRUCTIONS = `You supervise a local Codex agent on behalf of the user.
 
@@ -49,9 +50,11 @@ You may use codex_files to browse files inside a locally configured project and
 codex_artifact to receive, inspect, preview, or offer the original file for
 download. These tools transfer real file content through MCP; they are not a
 substitute for asking Codex to do project work. Paths are always relative to a
-configured project_id. Never invent an absolute local path.`;
+configured project_id. Never invent an absolute local path.
 
-const WAIT_RULE = `\n\nNON-NEGOTIABLE WAIT RULE: after this tool begins or continues work, if the returned task has terminal: false, continue calling codex_wait in the same assistant response until an authoritative app-server turn/completed event reports terminal: true. Timeouts, empty events, commentary, completed commands or plans, and Codex saying it is done are not completion. Resolve pending requests with codex_respond, steer with codex_send when needed, then call codex_result only after terminal: true.`;
+${RELAY_RULE}`;
+
+const WAIT_RULE = `\n\nNON-NEGOTIABLE WAIT RULE: after this tool begins or continues work, if the returned task has terminal: false, continue calling codex_wait in the same assistant response until an authoritative app-server turn/completed event reports terminal: true. Timeouts, empty events, commentary, completed commands or plans, and Codex saying it is done are not completion. Resolve pending requests with codex_respond, steer with codex_send when needed, then call codex_result only after terminal: true. ${RELAY_RULE}`;
 
 function jsonResult(value: unknown): { content: [{ type: "text"; text: string }] } {
   return { content: [{ type: "text", text: JSON.stringify(value) }] };
@@ -159,12 +162,19 @@ export function createMcpServer(manager: TaskManager): McpServer {
     annotations: annotation.result,
   }, async ({ task_id }) => jsonResult(await manager.result(task_id)));
 
+  server.registerTool("codex_submit_tool_result", {
+    title: "Return Web-side tool result to Codex",
+    description: `Return text or JSON and optional source links, document IDs or DOIs to a pending bridge_web_tool call. Status success, error, unavailable or declined must reflect reality. This responds to the original request and lets Codex continue the same turn, potentially performing destructive or network operations. Duplicate identical submissions are not resent; conflicting submissions fail. Never repeat a Web-side write after uncertain delivery. ${WAIT_RULE}`,
+    inputSchema: { task_id: taskId, request_id: z.string().min(1).max(128), ...relaySubmission.shape },
+    annotations: annotation.respond,
+  }, async ({ task_id, request_id, ...submission }) => jsonResult(await manager.submitToolResult(task_id, request_id, submission)));
+
   server.registerTool("codex_inspect", {
     title: "Inspect Codex evidence",
     description: "Read-only paginated inspection of transcript, plan, diff, commands, bounded command output, file changes, MCP calls, warnings or redacted raw events. Hidden chain-of-thought and credentials are never returned.",
     inputSchema: {
       task_id: taskId,
-      kind: z.enum(["transcript", "plan", "diff", "commands", "command_output", "file_changes", "mcp_calls", "warnings", "raw_event"]),
+      kind: z.enum(["transcript", "plan", "diff", "commands", "command_output", "file_changes", "mcp_calls", "tool_requests", "warnings", "raw_event"]),
       item_id: z.string().max(128).optional(),
       offset: z.number().int().min(0).max(1_000_000).optional(),
       limit: z.number().int().min(1).max(500).optional(),
